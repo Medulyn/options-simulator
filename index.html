@@ -15,8 +15,8 @@
     .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 1rem; }
     .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 1.25rem; }
     label { font-size: 13px; color: #666; display: block; margin-bottom: 5px; }
-    input, select { width: 100%; padding: 8px 10px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; background: #fff; color: #1a1a1a; }
-    input:focus, select:focus { outline: none; border-color: #888; }
+    input { width: 100%; padding: 8px 10px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; background: #fff; color: #1a1a1a; }
+    input:focus { outline: none; border-color: #888; }
     .toggle-row { display: flex; gap: 8px; }
     .toggle-btn { flex: 1; padding: 8px; border: 1px solid #ddd; border-radius: 8px; background: #f5f5f3; font-size: 13px; cursor: pointer; color: #1a1a1a; transition: all 0.15s; }
     .toggle-btn.active { background: #1a1a1a; color: #fff; border-color: #1a1a1a; }
@@ -139,6 +139,27 @@ function show(id, html) {
 }
 function hide(id) { document.getElementById(id).classList.add('hidden'); }
 
+async function fetchYahoo(url) {
+  const proxies = [
+    () => fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(8000) })
+          .then(r => r.ok ? r.json() : Promise.reject()),
+    () => fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(8000) })
+          .then(r => r.ok ? r.json().then(j => JSON.parse(j.contents)) : Promise.reject()),
+    () => fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(8000) })
+          .then(r => r.ok ? r.json() : Promise.reject()),
+  ];
+
+  for (const attempt of proxies) {
+    try {
+      const data = await attempt();
+      if (data) return data;
+    } catch {
+      continue;
+    }
+  }
+  throw new Error('Nepodařilo se načíst data z Yahoo Finance. Trh může být zavřený nebo zkus to za chvíli znovu.');
+}
+
 async function loadOptions() {
   const ticker = document.getElementById('ticker').value.trim().toUpperCase();
   const targetPrice = parseFloat(document.getElementById('target').value);
@@ -154,38 +175,23 @@ async function loadOptions() {
   show('status', 'Načítám cenu akcie...');
 
   try {
-    const proxy = 'https://api.allorigins.win/get?url=';
-
-    const quoteUrl = encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d`);
-    const quoteRes = await fetch(proxy + quoteUrl);
-    const quoteJson = await quoteRes.json();
-    const quoteData = JSON.parse(quoteJson.contents);
-
+    const quoteData = await fetchYahoo(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d`);
     if (!quoteData.chart?.result?.[0]) throw new Error('Ticker nenalezen. Zkontroluj symbol (např. AAPL, TSLA).');
     const currentPrice = quoteData.chart.result[0].meta.regularMarketPrice;
 
     show('status', `${ticker}: $${currentPrice.toFixed(2)} — načítám opční řetězce...`);
 
     const targetTs = Math.floor(new Date(targetDate).getTime() / 1000);
-    const optUrl = encodeURIComponent(`https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${targetTs}`);
-    const optRes = await fetch(proxy + optUrl);
-    const optJson = await optRes.json();
-    const optData = JSON.parse(optJson.contents);
-
+    const optData = await fetchYahoo(`https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${targetTs}`);
     if (!optData.optionChain?.result?.[0]) throw new Error('Opční data nejsou dostupná. Zkus jinou akcii nebo datum.');
 
     const chain = optData.optionChain.result[0];
-    const expirations = chain.expirationDates;
-    const selectedExp = expirations.reduce((prev, curr) =>
+    const selectedExp = chain.expirationDates.reduce((prev, curr) =>
       Math.abs(curr - targetTs) < Math.abs(prev - targetTs) ? curr : prev
     );
 
-    const optUrl2 = encodeURIComponent(`https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${selectedExp}`);
-    const optRes2 = await fetch(proxy + optUrl2);
-    const optJson2 = await optRes2.json();
-    const optData2 = JSON.parse(optJson2.contents);
+    const optData2 = await fetchYahoo(`https://query1.finance.yahoo.com/v7/finance/options/${ticker}?date=${selectedExp}`);
     const chain2 = optData2.optionChain.result[0];
-
     const contracts = optionType === 'call' ? chain2.options[0].calls : chain2.options[0].puts;
     const expDate = new Date(selectedExp * 1000);
     const daysToExp = Math.round((expDate - new Date()) / 86400000);
@@ -204,7 +210,9 @@ async function loadOptions() {
       const prem = c.lastPrice;
       const breakEven = optionType === 'call' ? c.strike + prem : c.strike - prem;
       const potGain = targetPrice
-        ? (optionType === 'call' ? Math.max(0, targetPrice - c.strike - prem) : Math.max(0, c.strike - prem - targetPrice)) * 100
+        ? (optionType === 'call'
+            ? Math.max(0, targetPrice - c.strike - prem)
+            : Math.max(0, c.strike - prem - targetPrice)) * 100
         : null;
       const itm = optionType === 'call' ? currentPrice > c.strike : currentPrice < c.strike;
       const distToTarget = targetPrice ? Math.abs(c.strike - targetPrice) : 0;
@@ -218,28 +226,25 @@ async function loadOptions() {
       ? `${((targetPrice - currentPrice) / currentPrice * 100).toFixed(1)}%` : '—';
     document.getElementById('m-days').textContent = daysToExp;
 
-    const tbody = document.getElementById('optionsTable');
-    tbody.innerHTML = scored.map((c, i) => {
+    document.getElementById('optionsTable').innerHTML = scored.map((c, i) => {
       const itmBadge = c.itm
         ? `<span class="badge badge-green">ITM</span>`
         : `<span class="badge badge-amber">OTM</span>`;
       const recBadge = i === 0
         ? `<span class="badge badge-blue">nejlepší</span>`
         : i < 3 ? `<span class="badge badge-green">vhodné</span>` : '';
-      const expStr = c.expDate.toLocaleDateString('cs-CZ');
-      const gainStr = c.potGain !== null ? `$${c.potGain.toFixed(0)}` : '—';
       return `<tr class="${i === 0 ? 'best' : ''}">
         <td>$${c.strike.toFixed(0)}</td>
-        <td>${expStr}</td>
+        <td>${c.expDate.toLocaleDateString('cs-CZ')}</td>
         <td>$${c.prem.toFixed(2)}</td>
         <td>$${c.breakEven.toFixed(2)}</td>
-        <td>${gainStr}</td>
+        <td>${c.potGain !== null ? '$' + c.potGain.toFixed(0) : '—'}</td>
         <td>${itmBadge}</td>
         <td>${recBadge}</td>
       </tr>`;
     }).join('');
 
-    drawPayoff(scored[0], currentPrice, targetPrice);
+    drawPayoff(scored[0], currentPrice);
     hide('status');
     show('results');
 
@@ -251,13 +256,12 @@ async function loadOptions() {
   }
 }
 
-function drawPayoff(opt, spot, target) {
+function drawPayoff(opt, spot) {
   const ctx = document.getElementById('payoffChart').getContext('2d');
   if (chartInstance) chartInstance.destroy();
   const range = spot * 0.25;
-  const step = range / 50;
   const prices = [], profits = [];
-  for (let p = spot - range; p <= spot + range; p += step) {
+  for (let p = spot - range; p <= spot + range; p += range / 50) {
     prices.push(parseFloat(p.toFixed(2)));
     const gross = optionType === 'call' ? Math.max(0, p - opt.strike) : Math.max(0, opt.strike - p);
     profits.push(parseFloat(((gross - opt.prem) * 100).toFixed(2)));
@@ -267,7 +271,6 @@ function drawPayoff(opt, spot, target) {
     data: {
       labels: prices,
       datasets: [{
-        label: 'Zisk/ztráta na kontrakt ($)',
         data: profits,
         backgroundColor: profits.map(v => v >= 0 ? 'rgba(29,158,117,0.75)' : 'rgba(226,75,74,0.65)'),
         borderWidth: 0,
@@ -275,7 +278,6 @@ function drawPayoff(opt, spot, target) {
     },
     options: {
       responsive: true,
-      maintainAspectRatio: true,
       plugins: {
         legend: { display: false },
         tooltip: {
@@ -289,16 +291,11 @@ function drawPayoff(opt, spot, target) {
         x: {
           ticks: {
             maxTicksLimit: 7,
-            callback: (val, i, ticks) => {
-              const hits = [0, Math.floor(ticks.length / 2), ticks.length - 1];
-              return hits.includes(i) ? `$${prices[i]}` : '';
-            }
+            callback: (val, i, ticks) => [0, Math.floor(ticks.length/2), ticks.length-1].includes(i) ? `$${prices[i]}` : ''
           },
           grid: { display: false }
         },
-        y: {
-          ticks: { callback: v => `$${v}` }
-        }
+        y: { ticks: { callback: v => `$${v}` } }
       }
     }
   });
